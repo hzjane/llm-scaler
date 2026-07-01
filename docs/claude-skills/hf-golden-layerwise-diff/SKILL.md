@@ -116,6 +116,33 @@ diff <(...) <(...)   # 或逐行肉眼对 mean/absmax
 - 激活函数(gelu_tanh / silu)的 kernel 实现或 `approximate` 模式不符。
 - 后端定制 kernel(fp8 GEMM / paged_attn)在该 shape 下数值不对。
 
+## ⭐ 打 trace 的高危陷阱(实操踩过，会让你误判)
+
+- **forward hook 里 `return` 非 None 会替换 forward 输出**：打 trace 时 hook **只 print、绝不 return**。
+  实战:hook 里 return 了 stat tuple，把 lm_head 输出换成了 tuple，导致 `final_logit_softcapping` 报 tuple 错。
+- **deferred-residual 陷阱**：某些后端的 decoder layer 返回 `(hidden_states, residual)` 但**未做残差相加**(fused path 推迟到下一层)。
+  真实层输出 = `(hs + residual) * layer_scalar`，直接 hook `hs` 会假性发散误导对比 → **必须捕获两元素相加**。
+  另 `layer_scalar`(每层学习标量，如 0.0045~0.887)是易漏的 buffer，别忘乘。
+- **TP 分片下逐层 absmax 可能"巧合接近"掩盖真实发散** → 别只比 absmax，要比 first-N 值 / 最终 logits top1；严格逐元素比只在 TP=1 成立。
+- **TP+spawn 下 monkeypatch 跨不过进程边界** → 用 env-gated 源码插桩，只在 rank0 print。
+- **dummy_run/profile_run 的全 0 张量输出会混进 trace** → 按「hmax>0 且真有内容」筛真实 forward；prefill 全对而 decode 首步 NaN 常指向 mamba/GDN state 被 decode kernel 写坏。
+
+## 装不了 HF golden 时的替代方案(无 golden 排除法)
+
+有时环境**装不了 HF golden**:transformers 版本不识别该 arch(如 5.8.0 不识别 `gemma4_unified`/DiffusionGemma,连 config 都加载不了),或权重无自定义建模代码。此时退而用:
+
+- **同 backbone 成熟模型 A/B 对照**:拿一个共享同一 backbone 的成熟自回归模型(如 gemma-4-26B)作 ground truth。
+  它 gsm8k 5/5 干净 → **一锤定音排除 fp8/XPU/backbone/RoPE/tokenizer**，把问题钉死在新模型的特有路径(diffusion 4/5 重复 vs 26B 5/5)。
+- **逐层 cosine 塌缩插桩**:dump 相邻位置 hidden/logits 的 cosine 逐层演化(如 inputs 0.05 → post_attn 0.9 → logits 0.99),定位"哪一层把区分抹平"。全部 env-gated 保留为诊断工具。
+- **组件数值单测**:把可单点验证的组件(attention 拆批/双向 kernel/SC/positions/slot_mapping/MoE 配置/routing)逐一数值验证排除，剩下的用最小改动 A/B。
+- **diff vs 上游参考实现(比逐层 dump 更高 ROI 的前置判断)**:容器跑的是 fork，直接拉上游首次 enable 该模型的 PR 原版对比 fork 改了什么(residual PP 路径、YOCO 切分等)，往往比逐层 trace 更快锁定嫌疑。
+
+## ⚠️ 先排除"非数值 bug"再逐层 diff
+
+- **输出重复/循环的头号真根因常是 prompt/chat 模板，不是 kernel**：裸 prompt 喂 -it 模型不 apply chat_template → 退化循环;
+  gemma 系默认 `enable_thinking=False` 预填空 `<|channel>thought` 致重复。**HF golden 本身也循环 → 证明非后端/量化 bug**(GitHub #40080 "Not vLLM-specific")。
+  修复:走 chat template + `chat_template_kwargs={"enable_thinking":true}` + few-shot + 大 `max_tokens`。别在这种情况下打逐层 trace(实战浪费了大量精力)。
+
 ## assets
 
 - `hf_reference.py` — 实战验证过的 HF golden-reference 模板(gemma-4-31B)。

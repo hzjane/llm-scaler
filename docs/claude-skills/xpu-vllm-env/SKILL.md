@@ -13,11 +13,16 @@ description: Intel XPU(BMG/Arc) 上 vllm-xpu + llm-scaler(ESIMD kernel) 的开�
 向用户确认 / 自行探测这三样，写下来再动手：
 1. **容器名**(如 `wj-test-new-021-gc`)。所有命令走 `docker exec <容器> bash -c '...'`，所有路径是容器内路径。
 2. **vllm 代码位置**：可编辑的 vllm-xpu 源码目录(常见 `/workspace/<name>` 或 `/llm/.../vllm`)。
-   探测：`docker exec <c> bash -c "python3 -c \"import vllm,os;print(os.path.dirname(vllm.__file__))\""`
-   及 `cd <vllm> && git branch --show-current`。确认是「源码可改并即时生效」还是「装在 site-packages 只读」。
-3. **kernel 代码位置**：llm-scaler 的 custom-esimd-kernels checkout(常见
-   `/llm/models/test/llm-scaler/vllm/custom-esimd-kernels-vllm`，host 可能同时挂在 `/home/.../llm-scaler`)。
-   确认能否原地 `setup_*.py build_ext --inplace` 重编。也确认 `vllm_xpu_kernels`(另一套 kernel)装在哪。
+   ⚠️ **`vllm` 是 namespace package，`vllm.__file__` 常为 `None`**——别用它定位。改用
+   `docker exec <c> bash -c "python3 -c \"import vllm.model_executor as m,os;print(os.path.dirname(m.__file__))\""`(具体子模块的 `__file__`)
+   及 `cd <生效目录> && git branch --show-current`。确认是「源码可改并即时生效」还是「装在 site-packages 只读」。
+   ⚠️ **同名多目录陷阱**：`/workspace/vllm` vs `/workspace/enable-diffusion-models` 会被合并成一个 `vllm` 包，editable 装的是哪个决定你读/改的是不是生效代码；
+   且 `cd /workspace` 下跑 python 会被 `sys.path[0]=''` 劫持到 cwd 里的旧 checkout → **在 `/root` 或非仓库目录跑**。判断「当前 checkout 与 BKM/upstream 是否同一份」用 `git cat-file -t <commit>`。
+3. **kernel 代码位置**：注意有**三套**互相独立的代码(更新方式各异)：
+   - (a) **vllm-xpu 源码仓**(editable，改 `vllm/...` 即时生效)——它是「纯 vllm + llm-scaler patch 应用后」的产物，仓里通常没有 patch 文件本身。
+   - (b) **custom-esimd-kernels**(常见 `/llm/models/test/llm-scaler/vllm/custom-esimd-kernels-vllm`，host 可能挂在 `/home/.../llm-scaler`)：**原地 `setup_*.py build_ext --inplace` 重编**，提供 `esimd_*`/`q4_0`/`moe_int4`。
+   - (c) **vllm-xpu-kernels**(analytics-zoo 那套，常见 `/llm/vllm-xpu-kernels`)：**pip wheel 仓，`pip install -e` 或重 build wheel 才生效，改 git 工作目录源码不生效**；提供 `_xpu_C.*`/`_moe_C.*`(cutlass grouped GEMM/gdn_attention/fp8_gemm)。
+   三套的详细区分/构建/patch 迁移见专项 skill `xpu-vllm-kernels-and-patch`。
 - 顺带：`docker exec <c> python3 -c "import torch;print(torch.__version__, torch.xpu.get_device_name(0))"`
   记录 torch 版本 + GPU(BMG `0xe223` 等)。
 
@@ -44,10 +49,16 @@ description: Intel XPU(BMG/Arc) 上 vllm-xpu + llm-scaler(ESIMD kernel) 的开�
 - **push 是外发动作，必须先问用户**。host 上 `.git/refs` 可能 permission denied(之前 commit 都在容器内 root 做的)→ git 操作优先在容器内。
 
 ## kernel build(ESIMD / custom-esimd-kernels)
-- 单模块快编：`cd <kernel仓> && TORCH_XPU_ARCH_LIST=bmg-g21 python3 setup_<feature>_only.py build_ext --inplace`
+- 单模块快编：`cd <kernel仓> && TORCH_XPU_ARCH_LIST=bmg python3 setup_<feature>_only.py build_ext --inplace`
   (有 setup_eagle_only / setup_moe_only / setup_moe_int4_only / setup_gemv_only / setup_q4_0_only 等)。
+- ⭐**编译必须 `TORCH_XPU_ARCH_LIST=bmg`**(或 `bmg-g21`)：默认 `torch.xpu.get_arch_list()` 含 XeLPG 集显(arl-h/mtl-h/lnl-m/ptl-*)，
+  dpas2/BF16 在 XeLPG 不支持 → 报 "dpas2 not supported"/"BF type not allowed"。只编 BMG 绕开。
 - **改 .h/.hpp(header)后必须先删对应 .o**(ninja 不追踪 header 变更)，否则改动不生效。
 - 编出的 .so 要 cp 到 `site-packages/custom_esimd_kernels_vllm/` 才被 vllm 加载(除非仓本身在 path 上)。
+- ⚠️ **`_vllm_fa2_C`/`_xpu_C` 的 RUNPATH 优先从 `build/temp` 加载，不是 site-packages**——替换/copy 这类 .so 必须**两处都更新**，否则 build/temp 旧版静默优先生效(实战翻过车)。
+- ⚠️ **别删 `.ninja_log`**(会强制重编 oneDNN ~30min)；`libgrouped_gemm_xe_2.so` 是独立子库可单独 `ninja` 再手工 relink。
+- ⚠️ **kernel 修复是 per-容器 per-checkout 的**：某容器改好的 kernel 不会自动同步到另一容器。「A 容器能跑 B 容器崩/昨天对今天错」时对齐「site-packages 实际加载的 .so 时间戳 + rpath + 源码 grep 关键符号 + `git log --all --grep`」。
+- ⚠️ 部分分支的 ESIMD kernel 源文件**未被 git 跟踪**；`git clean`/`filter-branch` 前确认 tracked 状态，别清掉 untracked 源文件。
 - 验证 op 是否注册成 dispatcher：**别信 `dir(torch.ops.<ns>)`**(惰性加载列不全)，用
   `torch._C._jit_get_schemas_for_operator("<ns>::<op>")`，不抛异常=已注册。
 
@@ -56,8 +67,12 @@ description: Intel XPU(BMG/Arc) 上 vllm-xpu + llm-scaler(ESIMD kernel) 的开�
 - **写/接 ESIMD kernel 优化性能** → `vllm-xpu-esimd-optimize`(reproducer→精度门禁→profile→kernel 循环)。
 - **开 XPU graph / cudagraph 提速 / graph 没生效/崩/hang** → `xpu-graph-enable`。
 - **模型输出乱码/精度和 HF 对不上** → `hf-golden-layerwise-diff`(HF golden 逐层 diff)。
-- enable 新模型 / 量化(fp8/sym_int4) / streaming load / benchmark：无专项 skill，按本 skill 的规约 +
-  现有资产脚本(常在 `<host>/test/opt_gemma4/` 或 `/llm/models/test/`)操作。
+- **从零 enable 一个新模型/新架构(移植 upstream PR、config vendoring、权重映射、多模态)** → `xpu-vllm-enable-new-model`。
+- **enable 量化 / 量化后崩/乱码/DEVICE_LOST / fp8-int4 数值 bug** → `xpu-vllm-quant-enable-debug`。
+- **纯静态判断某架构/PR 能否在 XPU 跑或移植 / 版本 feature diff(不要求先跑起来)** → `xpu-vllm-static-feasibility`。
+- **vllm-xpu-kernels wheel 报错/升级 / 改 kernel 源码不生效 / vllm.patch 应用 / 版本迁移 / 跨容器 .so 不一致** → `xpu-vllm-kernels-and-patch`。
+- **扩散式 LLM(diffusion decoding，如 DiffusionGemma)enable/测性能/优化** → `xpu-diffusion-llm`。
+- benchmark / 其它：按本 skill 的规约 + 现有资产脚本(常在 `<host>/test/opt_gemma4/` 或 `/llm/models/test/`)操作。
 
 ## 常用资产位置(确认后按实际为准)
 - 启动脚本：`/llm/models/test/*.sh`(gemma.sh / bench.sh / xy.sh 等)。

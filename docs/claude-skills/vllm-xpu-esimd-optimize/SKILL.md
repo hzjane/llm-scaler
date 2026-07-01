@@ -363,6 +363,55 @@ The bisection priority list, in order:
 4. **Git bisect within `$VLLM_PATH`** — checkout an older commit, rerun Phase 2. Bisect interval halves each step. We have caught bugs this way at three distinct levels: (a) MoE kernel called with `M>1` prefill chunk produces NaN (`f7c0693e9`), (b) `GeluAndMul` esimd path NaN at large `d` (`28d462ed5`), (c) attention backend selector chose FLASH_ATTN where head_size=512 silently NaN'd (`config.py` XPU exception).
 5. When you do find the offending commit, **fix by gating, not reverting** — narrow the activation condition (`d <= 4096`, `M == 1`, etc.) so the optimization keeps working in its safe regime. Always add the new gate as both a hard condition and an env override.
 
+### Phase 8b — Wire-up 阶段的坑清单(kernel 隔离对但接进模型就坏)
+
+kernel 单测过了、接进 vllm 却崩/慢/乱码，几乎都栽在这些**集成路径**问题上(不是 kernel 数学)。逐条 check:
+
+- ⭐**隔离测试 PASS ≠ e2e 正确**——头号陷阱。三种成因:
+  - **ref 与 kernel 共享同一套可能错的约定** → 永远吻合。必须对**真实 Triton/官方 golden**;
+    TP 场景要拿**两 rank 相加**比 all-reduce 后的 gold(别拿单 rank partial 比，会误判成 cos 0.8"语义错"，正确是 0.9997)。
+  - **单测没覆盖真实 regime**:单测用 q_len≤window 让 sliding 窗口没起作用、用内置 topk 而模型用 routed 变体、用小合成权重侥幸避开满量程 fp8(|w|→288)溢出。→ 单测必须用**贴近真机的 shape/量级/真实 dump 的 in-model 张量**。
+  - **两个完全不同的 kernel 接进同一路径产生相同失败(0/5+同样慢)** → 铁证 bug 在共享集成路径(routing 布局/gather/accumulate/scale 重量化)，不是 kernel。决定性 debug = 集成路径同时算 Triton golden 逐环节 dump diff。
+- **旁路 FusedMoE 的 4 个必踩坑**:① 模型特有 routing scale(如 gemma4 `per_expert_scale` 0.98-1.02)内置 topk 不含 → 需 `_routed` op 接受外部 routing_weights/indices;
+  ② **TP 下漏 all-reduce** → 绕过 `FusedMoE.runner` 就得手动补 row-parallel all-reduce，否则输出全 0;
+  ③ **thread_local 单 buffer 跨层复用**(所有 MoE 层共享 `sg_final_output`，下层覆盖上层) → narrow+clone 或 kernel 内 ring buffer(`SG_FINAL_RING=4`);
+  ④ **M≥16 prefill 累加器精度不足输出 NaN** → 限制 esimd 只走 decode(gate `x.size(0)==1`)。
+- **profile_run 全 0 输入会误触 esimd 路径 + 让对拍误判**(out_norm=ref_norm=0 假性通过) → 门控要能识别/排除 profile_run。
+- **fp16 累加器溢出**:per-tensor scale 应在 fp16 累加**前**折叠进权重 tile(累加后 K=2816 raw 部分和溢出 65504→inf);gelu_tanh 的 exp clamp inner ±30 防 NaN。单个 NaN 经残差污染整批 → 0/5 空输出。
+- **gate 认知更新**:`x.size(0)==1` 注释"M≥16 fp32 累加器溢出 NaN"**可能已过时**(当前 fp8 kernel fp32 DPAS 累加 T=1..256 单测全对);真实拦阻常是**性能**(per-route M=1 DPAS 无权重复用)+ routed batch 集成 bug，不是数值。判断量化类型用 `quant_config.get_name()` 而非 `hasattr(layer,"weight_scale")`(后者在 `process_weights_after_loading` 之前永远 False)。
+
+### Phase 8c — 给 ESIMD attention kernel 加原生 GQA 支持
+
+给 ESIMD `page_attn_decode`(eagle kernel)加原生 GQA=2(去掉 vllm 的 pad-to-4)的通用手法:
+
+- ⭐**先破解 kernel 里的"魔法常数"到底映射什么**——常是多义复用。实战:GQA=4 kernel 里的 "4" **不是 gqaRatio**——
+  Phase1 的 4 线程实际是**切 head_dim(256=4×64)做 QK 部分点积**，只是 softmax/reduction 阶段"复用为 4 个 q-head"(数字巧合);Phase2 的 2 线程是**切 token**。
+- **零回归模式**:新增独立 device 函数(`sdpaDecodeGqa2Phase{1,2}`)而非改原函数;**保留完全相同的线程几何和 simd 宽度**，只改(1)q-head 循环 4→2、(2)q-head→SLM 映射、(3)多余线程在 `barrier()` **之后** early-return(避免 barrier 分歧)。计算量自然减半(只算真 q-head)。
+- host 按 gqaRatio 分派;`gqaGroups=gqaRatio/4` 在 ratio=2 时整除得 0 会崩 → 用 `gqaGroupsLaunch=(gqaRatio>=4)?gqaRatio/4:1` 兜底;`eagle_ops` schema/host 签名一字不变。
+- fp8 走 DPAS 时:A 矩阵 RepeatCount=8，GQA=2 只填前 2 行，padding 行算 0 被 C 累加器天然忽略——不用改 DPAS 形状。
+- **三级数值门禁**:(1) PyTorch SDPA 绝对 golden、(2) padded-to-4(老 kernel) 、(3) native GQA=2。门槛先 padded-vs-ref(fp16~2e-5/e4m3~6e-4/e5m2~3e-5)，再要求 **native-vs-padded ≈ 0(逐元素，实测 ≤8e-6)**。**必须扫长序列 16k/32k/64k + 跨 phase 分界形状(batch>1、多 kv-head、跨 1024 分界)**，否则漏长上下文 bug。
+- **性能做 kernel 级 A/B**(端到端短上下文会被 attn 占比小 + Triton 固定开销误导)。kernel 级实测 native 比 padded 快 1.4-1.85x。commit 分支 `feat/page-attn-gqa2-native`。
+- ⚠️ **page_attn_decode 完全不识 sliding window**(只传 `seqused_k` 对全部 kv 做 attention)。gemma4 sliding_window=1024，prompt>1024 时 sliding 层应只看最近 1024，page_attn 却看全程 → 长上下文输出偏离。这是 esimd page_attn 对 sliding 模型的**固有缺陷**(GQA=4 padded 同样没传 window)，不是 GQA 改动引入的。sliding 模型长上下文 decode **走 varlen**(既快 7-10% 又唯一正确)。
+
+### Phase 8d — fp8 / DPAS / VNNI 的硬件坑(写任何 fp8 kernel 通用)
+
+- **DPAS `<8,8>` 必须 fp16 累加器**:float-acc 版是 `#ifdef` 死代码(从没编译过)，XeLPG/mtl-h 不支持该 intrinsic。
+- **BMG 上 `dpas RepeatCount=4 + fp16` 产 NaN + 非确定性**(未文档化) → 用 RepeatCount=8 + 前几行 A 填 0 padding。
+- **dpas 下 OOB 字节的 NaN 会经 K 维累加扩散到所有 N=token lane** → reshuffle 时显式 zero-merge(scalar MAC 靠最终 merge 兜底、dpas 不行)。
+- **`lsc_gather<u32,NElts,16>` 返回 SoA 布局**(先 16 lane 的第 0 个 u32，再第 1 个)，不是 lane 内 AoS;fp16 用 NElts=4 已默认依赖此 SoA，写 fp8 按 AoS 解读会 q-head 重复。
+- **`block_load<u8,32>` 在 BMG 上不兼容**(32 bytes < 最小 block-load 尺寸) → 最低 VL=64 + tail overlap-read(从 `K-VL` 起读最后一段、mask 重叠)。
+- **VNNI/DPAS B 矩阵 layout 转置**:fork vs 上游权重 layout 可能镜像(`[E,N,K]` vs `[E,K,N]`);只 swap 2D-load 坐标不够——`fp8e4m3_block_to_vnni` 仍按原 major 解读 → B 语义被转置 → 乱码。**ESIMD 的 Transposed block_load 对 fp8/u8 不支持**(只支持 u32/u64) → 硬件转置行不通，得新写 `_nk` 版 vnni pack 用 stride-16 select 在寄存器内逻辑转置。
+- **K 对齐坑(数值正确但输出错)**:`select_vl_ks()` 最低到 VL=128 时，K 不是 128 倍数会 `block_load` 越界读垃圾(如 K=1056/704)→ decode 从第 2 个 token 起错;**独立 random-weight 测试测不出**(测试用的 K 恰好对齐)。修:kernel 端支持 VL=64 + tail。1056=2^5·3·11 无法被任何 VL≥64 整除是关键约束。
+- **ESIMD 无 fp8→fp16 native cast、dpas 不吃 fp8**;`lsc_load_2d` 换 `lsc_gather` 常因转置 reshuffle 反而慢 20-30pp(代数等价不代表快)。
+- **编译坑**:`TORCH_XPU_ARCH_LIST=bmg` 只编目标设备;大 `simd<fp16,2048>` 权重 buffer + 运行时 index → GRF indirect addressing 溢出("spans complete GRF file") → 改逐 16-K `lsc_load_2d` 小 tile;全量 `build_ext` 会撞无关 extension "translation unit too large" → 写 `setup_<feature>_only.py` 单 extension 编;注意 `esimd_gemm_fp8_pert` 在 `esimd_kernel_gemm.sycl`(另一个 extension)，只编 gemv_only 会漏掉 GEMM 改动。
+
+### Phase 8e — fused kernel 的硬约束
+
+- `esimd_fused_add_rms_norm` 硬编"weight 需预调 w+1.0"(Gemma 风格)，但标准 RMSNorm(`x*w`)不加 1 → 上 fused norm 前**必须验证语义**(gemma4 实测直接 `normed*w` 可用不需 +1)。
+- **GRF 8KB/12KB 限**:三合一 fuse(如 `resadd_norm_gemv` K=2816 需 ~11KB GRF)寄存器溢出不可用;`simd<float,VL>[MAX_CHUNKS]` 超 12KB 会 silently spill → server 负载下 `UR_RESULT_ERROR_OUT_OF_RESOURCES`。硬编 VL=512 需改成按 K 选(2816%512≠0)。
+- **M=8/16 esimd_gemm 反而慢**(-35%~-42%):esimd WS kernel single-thread-per-output-row，大 M 干不过 onednn tiling → decode 阈值压到 M≤4(实践 M==1)。
+- **fp8 大 M GEMM 别默认比 fp16 快**:`torch._scaled_mm` 在 BMG 可能走软件 dequant 路径(74 vs fp16 131 TFLOPS)。见 anti-patterns。
+
 ## Anti-patterns (don't waste time on these)
 
 - **Don't dismiss unitrace — but scope it right (this reverses the old blanket "never use unitrace").** It is the *fastest* way to get the launch-bound-vs-compute-bound verdict and the kernel-family breakdown (Phase 4 Lens C) — reach for it FIRST when you don't yet know where the time goes. The real failure mode is narrow: a **server-mode** trace with `--chrome-call-logging` on a heavy **ESIMD decode** loop can hang the worker or refuse to flush (it needs SIGINT to the EngineCore, not the api-server — full gotcha list in `/llm/models/test/unitrace.md`). Mitigations that make it reliable: **always trace the online server** (offline busy% under-counts and hides bottlenecks like allreduce — see "Which mode" above), resolve the EngineCore by your own port's api-server (not `pgrep|head -1`), start with `--chrome-device-logging` only (add `--chrome-call-logging` only when you specifically need host submit-gaps), and wrap in `timeout`. If it still won't flush after a couple tries, **don't chase it** — fall back to Lens A manual `torch.xpu.synchronize() + perf_counter` instrumentation.

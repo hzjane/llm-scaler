@@ -186,6 +186,21 @@ cudagraph_mode=CUDAGraphMode.FULL_DECODE_ONLY, cudagraph_capture_sizes=[1,2,4,8]
 若见 `Skipping CUDA graph capture` 或 `Overriding to NONE` = 被降级/跳过，回到「三种 mode」「多卡三处必改」排查。
 确认提速：同模型同请求 graph vs `--enforce-eager` 测 decode TPOT(小 batch 最明显)。
 
+## varlen 的 graph-safe 快捷路径(§A 的另一条出路)
+§A 说 prefill/varlen 用 `work_group_scratch` 导致 capture 崩。但对 **decode(query_len=1)** 有捷径:
+- varlen(cutlass-sycl，`flash_api.cpp`)的 `work_group_scratch` **大小只依赖 split-K 策略、不依赖 seqlen**;
+  decode 通常 `num_splits=1` → scratch=0。
+- **Quick-check**:强制 `get_num_splits()` 返回 1，scratch 消失，graph 可能直接过(先验证再投入)。
+- **彻底修**:用 `local_accessor` 替代 `work_group_scratch`(改 `paged_decode.hpp`+`chunk_prefill.hpp`，实战 commit `c7a3a06`/`33254e8`/`13642f0`，工作量 2-3 天)。
+- ⚠️ **这个修复是 per-容器 per-checkout 的**:某容器改好不会自动同步到另一容器 → "昨天对今天错/A 容器能跑 B 崩"时按 `xpu-vllm-env` 的跨容器 .so 同步清单排查(对齐 .so 时间戳/rpath/源码 grep `work_group_scratch_size`/`git log --all`)。
+
+## GDN / linear-attention × torch.compile 的确定性错误(不是 graph capture 问题)
+- **Qwen3.5/GDN(linear-attention)在 torch.compile/cudagraph 下数值确定性错误输出 `!!!!`**：2×2 真值表验证 eager✅ / compile❌，且**与 weight-clone workaround 无关**。
+  根因疑在 GDN 自定义 XE2 kernel 未正确注册进 graph、或 cudagraph 捕获了 stale mamba/ssm state。
+- 伴随症状:GDN forward 里改 `weight.data` 触发 `Inference tensors do not track version counter`(要移出 forward 到 load 后，但即便移出 compile 仍错)。
+- ⚠️ 另一个 GDN 隐患:XE2 `chunk_gated_delta_rule`/`gdn_attention` kernel 有 **OOB 写**(decode 行 chunk_size=1 写满 64 行 tile 越界)，会污染相邻显存/FP8 权重;b8.3 用首次 forward clone 权重 workaround，eager 有时可绕、compile 下无解。
+- 结论:遇 GDN/hybrid 模型上 graph/compile 报 `!!!!`，先按第 0 步确认 eager 是对的，这类属 kernel×compile 兼容性问题，非 capture/mutation。
+
 ## 踩坑速记
 - 杀 vllm 必须连 `spawn_main` 子进程按 PID 杀(否则孤儿 worker 占卡)；重启前清
   `/dev/shm/psm_* /dev/shm/sem.loky-*`(残留致下次 `BrokenPipeError`/`KeyError /psm_*`)。
