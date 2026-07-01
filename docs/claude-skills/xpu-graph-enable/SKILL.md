@@ -1,6 +1,6 @@
 ---
 name: xpu-graph-enable
-description: 在 Intel XPU(BMG/Arc) vLLM 上为模型启用 XPU graph(cudagraph capture/replay)消除 decode 的 kernel-launch 开销提性能(实测 decode TPOT 小 batch 最高 2.45x)。适用于：用户说"为什么 XPU graph 没效果/没生效""enable cudagraph/torch.compile 提速""decode launch-bound 想上 graph""多卡 graph 跑不起来/capture 崩/replay hang""cudagraph_mode/capture_sizes 怎么设""raw pybind 与 torch.ops dispatcher 区别"。覆盖：排查顺序(env 没生效是最高频)、多卡(TP≥2)启用三处必改、FULL_DECODE_ONLY vs PIECEWISE/FULL 选择、capture 崩溃(work_group_scratch)与 replay hang(MoE/ESIMD raw pybind→dispatcher)诊断、capture_sizes 约束。前提：torch 2.11+xpu、vllm-xpu(release v0.21.0 线)、能改 vllm 源码、ESIMD kernel(custom-esimd-kernels/vllm-xpu-kernels)。
+description: 在 Intel XPU(BMG/Arc) vLLM 上为模型启用 XPU graph(cudagraph capture/replay)消除 decode 的 kernel-launch 开销提性能(实测 decode TPOT 小 batch 最高 2.45x)。适用于：用户说"为什么 XPU graph 没效果/没生效""enable cudagraph/torch.compile 提速""decode launch-bound 想上 graph""多卡 graph 跑不起来/capture 崩/replay hang""cudagraph_mode/capture_sizes 怎么设""raw pybind 与 torch.ops dispatcher 区别"。覆盖：排查顺序(env 没生效是最高频)、多卡(TP≥2)启用三处必改、FULL_DECODE_ONLY vs PIECEWISE/FULL 选择、capture 崩溃(work_group_scratch)与 replay hang(MoE/ESIMD raw pybind→dispatcher)诊断、capture_sizes 约束、graph 下"先跑大 batch/高并发(gsm8k)再跑单条请求就输出 !!!!/感叹号"(ESIMD kernel static buffer 随 n_tokens 重分配致 graph 固化地址失效，eager 正常)的诊断与修复。前提：torch 2.11+xpu、vllm-xpu(release v0.21.0 线)、能改 vllm 源码、ESIMD kernel(custom-esimd-kernels/vllm-xpu-kernels)。
 ---
 
 # 在 Intel XPU vLLM 上启用 XPU graph 提 decode 性能
@@ -126,6 +126,60 @@ gc 初版 XPU graph 常只对 TP=1 验证；多卡(gemma4/qwen 唯一跑法)被�
 - 但**先排除第 0 步**(eager 是不是也 `!!!!`)：若 eager 也坏，与此无关。
 - 真要修：kernel 侧 schema 加 `Tensor(a!)`(需重编 kernel)，或 vllm 侧用 `direct_register_custom_op`
   + `mutates_args=[...]` 包一层正确声明 mutation 的 wrapper(`infer_schema` 生成 `(a!)`)。
+
+### D. capture 成功但输出 `!!!!`(static buffer realloc — graph 固化地址失效)⭐高频
+- **决定性诊断信号：必须"先跑大 batch、再回小 batch"才坏；纯小 batch / 服务刚起就跑小 batch 不坏。**
+  在线表现：先跑高并发(gsm8k 100 题 asyncio 齐发)，再发单条请求 → `!!!!`；单独发单条请求一直正常。
+  这个"被大 batch 污染"的时序特征是 D 类与 C 类(一上来就坏)的关键区分。
+- **⚠️ 别被"只有 batch=1 坏"误导——受害面是 `[1, max_size]` 整个区间，不止 batch=1，也不止离散的
+  capture_sizes。** 实测(污染后逐一探测)：capture=[1,2,4,8] 时 batch=1/2/4/8 全坏。原因见
+  `cudagraph_dispatcher.py`：`num_tokens <= max_size`(=最大 capture size)的请求**都走 graph replay**
+  ——正好命中 capture size 的直接 replay，没命中的(如 3/5/6/7)**向上 pad 到最近的 capture size** 后
+  replay(仍读固化地址)；只有 `num_tokens > max_size` 才 fallback eager。所以"看似只有 batch=1 坏"只是
+  因为你只用单请求(xinge)去测；gsm8k 大 batch(>max_size)走 eager 反而不坏(但它正是触发 realloc 的元凶)。
+- **⚠️ 加大 cudagraph_capture_sizes 不能修，反而扩大受害面**：抬高 `max_size` 等于把 `[1,新max_size]`
+  更大的区间全拉进"走 graph → 会中招"的范围。病根是 realloc 使固化地址失效，与 capture 了哪些 size 无关。
+  唯一正解在"消除 realloc / 让地址稳定"这一层(见下"修复")。
+- **根因**：ESIMD kernel 里的 `static thread_local torch::Tensor s_xxx`(跨调用持久 buffer)，其
+  `ensure_*` 在 `n_tokens` 变化时 `torch::empty` **重新分配**(经典写法 `if (s_cached_ntokens != n_tokens)`)，
+  且函数 `return s_final_output`(直接返回这个持久张量)。capture(batch∈capture_sizes，如≤8)时把
+  "MoE 输出在地址 A"**固化进 replay**；大 batch(>capture 上限，走 eager fallback)运行时 `ensure` 把
+  buffer realloc 到新地址、**旧地址 A 引用归零被释放**；之后小 batch 走 graph replay 仍指向已失效的 A
+  → 读到被复用的垃圾显存 → logits 全乱 → 采样出 `!` → `!!!!`。
+- **为什么只有 graph 坏、eager 不坏**：eager 每个 step 都重跑 host 端 `ensure_*`，kernel 总是用最新地址，
+  realloc 无所谓；graph replay **不重跑 host 逻辑**，按 capture 固化的地址跑 → 地址必须 capture 后永久稳定。
+  即"kernel 假设每次调用都重读地址"(eager 成立)与"graph 要求地址固化后不变"的契约冲突。
+- **定位手法**：① 先 env-gate 二分锁定到某 kernel 大类(本例 `DISABLE_ESIMD_MOE=1` 一关就好，而所有
+  细分 gate `DISABLE_ESIMD_MOE_GELU/_NORM/_BATCH_GROUPED/MOE_DECODE_GEMV/...` 都关不掉
+  → 说明肇事路径只被总开关覆盖)；② 顺着模型 forward 找到该 kernel 的 C++ 源，
+  `grep -n "static thread_local\|s_cached_ntokens\|torch::empty\|return s_"`，看到
+  `if (cached != n_tokens) { ... torch::empty ... } return s_final_output;` 即坐实。
+- **修复 = 让 buffer 地址永久稳定**："只增不重分配"——判定改 `if (s_cached_ntokens < n_tokens)`，
+  分配尺寸用 `an = max(s_cached_ntokens, n_tokens)`，`return s_final_output.narrow(0,0,n_tokens)`(零拷贝切片)。
+  加 env 开关(如 `MOE_STICKY_BUF=0` 回退原行为)便于 A/B。**这条 esimd MoE 路径通常 gate 在
+  `num_tokens<=128`**(更大走 upstream FusedMoE)，所以 buffer 上限就是 128，**额外显存 ~10MB/卡级别(可忽略)，
+  且 static 是文件级、全层共用一组不乘层数**；性能微正(省 realloc)。
+- **现成旁证**：同 `moe.sycl` 里 gemma4 的 `moe_forward_full_gelu_tanh` 早因 enable graph 踩过同坑，已用
+  `if (sg_cached_ntokens >= n_tokens) return;`(只增) + `SG_FINAL_RING=4` 输出 ring 修好(注释明说
+  "callers hold the returned tensor... we cannot overwrite it")。**新 enable 的模型若复用 qwen3_next 的
+  v1/v2 路径(`moe_forward_full`/`_v2`，用 `s_*`/`s2_*` + `!=` 重分配)就会复现**——对照 gemma4 改法移植即可。
+- ⚠️ 写 env 开关的 C++ 字符判定别踩 shell/py 转义坑：经 `python3 -c`/heredoc 注入 `e[0]=='0'` 时单引号
+  常被吃成 `e[0]==0`(与 NUL 比，永远 false，开关静默失效)。**用 ASCII 数值 `e[0]==48` 最稳**，或落地后
+  `grep` 一眼确认源码里引号还在。开关失效的征兆：`MOE_STICKY_BUF=0` 本该复现却不复现。
+
+### 离线复现器(D 类必备，比 online 快且能一键 A/B)
+关键：要让 decode batch **递减穿过 capture_sizes**——不能用等长 prompt(batch 恒定，要么全程 eager
+fallback 要么不触发 realloc)。给每条序列**不同 `max_tokens` 让它们陆续结束**，batch 自然从大降到小：
+```python
+# 阶段1 大 batch：长度各异 -> batch 逐步穿过 8/4/2/1
+sps=[SamplingParams(max_tokens=8+i*11, temperature=0, ignore_eos=True) for i in range(BIG)]
+llm.generate([{"prompt":P}]*BIG, sps)
+# 阶段2 单条 -> 看是否 !!!! (bad = text.count("!")>20)
+```
+`LLM(..., enforce_eager=False, compilation_config=CompilationConfig(mode=0,
+cudagraph_mode=CUDAGraphMode.FULL_DECODE_ONLY, cudagraph_capture_sizes=[1,2,4,8]))` 开 graph；
+`EAGER=1` 走 `enforce_eager=True` 做对照。env 带齐 `VLLM_XPU_ENABLE_XPU_GRAPH=1` + 启动那套
+(`ZE_AFFINITY_MASK/TORCH_LLM_ALLREDUCE/CCL_ZE_IPC_EXCHANGE/VLLM_WORKER_MULTIPROC_METHOD/VLLM_MLA_DISABLE`)。
 
 ## 验证 capture 真生效
 日志出现 `Capturing CUDA graphs (decode, FULL): N/N` + `Graph capturing finished` = 成功。
